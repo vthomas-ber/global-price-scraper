@@ -1,0 +1,8 @@
+{
+  "name": "global-price-scraper",
+  "private": true,
+  "type": "commonjs",
+  "dependencies": {
+    "playwright": "1.46.1"
+  }
+}

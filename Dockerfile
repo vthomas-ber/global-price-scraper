@@ -1,9 +1,6 @@
 FROM ruby:3.3.5-slim
 
-# --- System dependencies ---
-# - pkg-config: needed for sqlite3 gem native build
-# - nodejs + npm: required by Playwright driver (fixes "No such file or directory - node")
-# - chromium + chromium-driver: browser runtime
+# System dependencies
 RUN apt-get update -y && apt-get install -y \
   curl \
   ca-certificates \
@@ -17,23 +14,24 @@ RUN apt-get update -y && apt-get install -y \
   npm \
   && rm -rf /var/lib/apt/lists/*
 
-# --- Playwright config ---
-# We use system Chromium and do NOT download Playwright browsers during build.
+# Playwright config: use system Chromium, no browser download
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 
 WORKDIR /app
 
-# Install Ruby dependencies first (better caching)
+# ---- Node deps (Playwright JS) ----
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+
+# ---- Ruby deps ----
 COPY Gemfile Gemfile.lock ./
 RUN bundle install
 
-# Copy app code
+# ---- App code ----
 COPY . .
 
 ENV RACK_ENV=production
-
-# Render provides PORT; Sinatra binds to 0.0.0.0 in app.rb
 EXPOSE 3000
 
 CMD ["bundle", "exec", "ruby", "app.rb"]
