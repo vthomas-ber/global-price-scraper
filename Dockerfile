@@ -7,11 +7,12 @@ RUN apt-get update -y && apt-get install -y \
   git \
   build-essential \
   libsqlite3-dev \
+  pkg-config \
   chromium \
   chromium-driver \
   && rm -rf /var/lib/apt/lists/*
 
-# Playwright needs this
+# Playwright config
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 
@@ -19,12 +20,11 @@ WORKDIR /app
 
 # Ruby deps
 COPY Gemfile Gemfile.lock ./
-RUN bundle install --without development test
+RUN bundle install
 
 # App
 COPY . .
 
-# Render sets PORT automatically
 ENV RACK_ENV=production
 
 EXPOSE 3000
