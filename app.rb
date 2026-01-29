@@ -86,7 +86,7 @@ post "/scrape" do
   results = eans.map do |ean|
     Rules.validate_ean!(ean)
 
-    cache_key = "scrape:#{market}:#{ean}"
+    cache_key = "scrape:v2:#{market}:#{ean}"
     cached = cache.get(cache_key)
     next cached.merge("cached" => true) if cached
 
