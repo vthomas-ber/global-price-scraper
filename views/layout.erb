@@ -1,0 +1,21 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Global Price Scraper</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <div class="container">
+      <div class="header">
+        <div>
+          <h1>Global Price Scraper</h1>
+          <div class="sub">EAN-verified. Non-promotional RSV only. Golden domains first. Fast baseline (no headless browser).</div>
+        </div>
+      </div>
+      <%= yield %>
+      <div class="footer">Tip: if you get “No data”, it’s usually because the product page does not explicitly show the EAN in HTML (integrity rule working as intended).</div>
+    </div>
+  </body>
+</html>

@@ -1,7 +1,0 @@
-.bundle/
-vendor/
-node_modules/
-cache.sqlite3
-*.log
-.env
-.DS_Store

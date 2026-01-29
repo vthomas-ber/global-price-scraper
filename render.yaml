@@ -1,15 +1,16 @@
 services:
   - type: web
     name: global-price-scraper
-    env: docker
+    env: ruby
     plan: starter
-    autoDeploy: true
+    buildCommand: bundle install
+    startCommand: bundle exec rackup -o 0.0.0.0 -p $PORT
     envVars:
+      - key: RACK_ENV
+        value: production
       - key: SERPAPI_KEY
         sync: false
-      - key: CACHE_DB
-        value: /tmp/cache.sqlite3
-      - key: PW_TIMEOUT_MS
-        value: "20000"
-      - key: PW_LOCALE
-        value: "de-DE"
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: EANSEARCH_API_KEY
+        sync: false

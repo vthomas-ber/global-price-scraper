@@ -1,59 +1,105 @@
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <title>Global Price Scraper</title>
-  <style>
-    body { font-family: system-ui, -apple-system; margin: 24px; }
-    input, textarea, select, button { font-size: 14px; padding: 8px; }
-    textarea { width: 560px; height: 120px; }
-    pre { background: #f6f6f6; padding: 12px; overflow: auto; border-radius: 8px; }
-  </style>
-</head>
-<body>
-  <h2>Global Price Scraper (MVP)</h2>
-  <p>Enter up to 10 EANs. Output is JSON.</p>
+<div class="card">
+  <form method="post" action="/run">
+    <div class="grid">
+      <div>
+        <label>Market</label>
+        <select name="market">
+          <% @markets.each do |m| %>
+            <option value="<%= m %>" <%= "selected" if @market == m %>><%= m %></option>
+          <% end %>
+        </select>
 
-  <form id="f">
-    <label>Market:</label>
-    <select id="market">
-      <option>DE</option>
-      <option>NL</option>
-      <option>BE</option>
-      <option>UK</option>
-      <option>FR</option>
-      <option>DK</option>
-      <option>IT</option>
-      <option>ES</option>
-      <option>PL</option>
-      <option>PT</option>
-      <option>SE</option>
-      <option>NO</option>
-    </select>
-    <br/><br/>
-    <label>EANs (one per line, max 10)</label><br/>
-    <textarea id="eans"></textarea><br/>
-    <button type="submit">Scrape</button>
+        <div style="height:12px"></div>
+
+        <button class="btn" type="submit">Scrape</button>
+        <div class="small" style="margin-top:10px;">
+          Uses SERPAPI discovery + HTML verification + Gemini extraction.
+        </div>
+      </div>
+
+      <div>
+        <label>EANs (max 10, one per line)</label>
+        <textarea name="eans" placeholder="4003586100399&#10;..."><%= @eans_text %></textarea>
+      </div>
+    </div>
   </form>
+</div>
 
-  <h3>Result</h3>
-  <pre id="out"></pre>
+<% if @results %>
+  <hr />
 
-  <script>
-    document.getElementById("f").addEventListener("submit", async (e) => {
-      e.preventDefault();
-      const market = document.getElementById("market").value.trim();
-      const eans = document.getElementById("eans").value
-        .split("\n").map(x => x.trim()).filter(Boolean).slice(0, 10);
+  <% @results.each do |r| %>
+    <div class="card" style="margin-bottom:14px">
+      <div style="display:flex; justify-content:space-between; gap:12px; align-items:center;">
+        <div class="mono"><strong>EAN:</strong> <%= r[:ean] %></div>
+        <% if r[:error] %>
+          <span class="badge no">ERROR</span>
+        <% else %>
+          <span class="badge ok">OK</span>
+        <% end %>
+      </div>
 
-      const res = await fetch("/scrape", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ market, eans })
-      });
+      <% if r[:error] %>
+        <div class="small" style="margin-top:10px; color: var(--danger);"><%= r[:error] %></div>
+      <% end %>
 
-      document.getElementById("out").textContent = await res.text();
-    });
-  </script>
-</body>
-</html>
+      <div class="small" style="margin-top:10px">
+        <strong>Master:</strong>
+        Product Name: <%= r.dig(:master, :product_name) || "-" %>;
+        Unit Type: <%= r.dig(:master, :unit_type) || "-" %>;
+        Grammage: <%= r.dig(:master, :grammage) || "-" %>
+      </div>
+
+      <div style="margin-top:12px">
+        <table>
+          <thead>
+            <tr>
+              <th>Vendor</th>
+              <th>RSV (incl VAT)</th>
+              <th>VAT</th>
+              <th>Promo</th>
+              <th>Flag</th>
+              <th>Pack</th>
+              <th>Evidence (EAN found?)</th>
+              <th>URL</th>
+            </tr>
+          </thead>
+          <tbody>
+            <% if r[:rows].empty? %>
+              <tr><td colspan="8" class="small">No valid rows (EAN not found in HTML or price not extractable).</td></tr>
+            <% else %>
+              <% r[:rows].each do |row| %>
+                <tr>
+                  <td><%= row[:vendor] %></td>
+                  <td><%= row[:rsv] ? "#{row[:rsv]} #{row[:currency]}" : "-" %></td>
+                  <td><%= row[:vat_info] || "rate not stated" %></td>
+                  <td><%= row[:promo_price] || "-" %></td>
+                  <td><span class="badge <%= row[:flag] == "Comparable" ? "ok" : "no" %>"><%= row[:flag] %></span></td>
+                  <td><%= row[:pack_format] || "-" %></td>
+                  <td><%= row[:ean_evidence] %></td>
+                  <td class="mono"><a target="_blank" href="<%= row[:url] %>">open</a></td>
+                </tr>
+              <% end %>
+            <% end %>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="small" style="margin-top:10px">
+        <strong>Average RSV:</strong>
+        <%= r[:average_rsv] ? "#{r[:average_rsv]} #{r[:currency]} (N=#{r[:avg_n]})" : "-" %>
+      </div>
+
+      <% if r[:discards]&.any? %>
+        <div class="small" style="margin-top:12px">
+          <strong>Discards:</strong>
+          <ul>
+            <% r[:discards].each do |d| %>
+              <li class="mono"><%= d[:url] %> — <%= d[:reason] %></li>
+            <% end %>
+          </ul>
+        </div>
+      <% end %>
+    </div>
+  <% end %>
+<% end %>

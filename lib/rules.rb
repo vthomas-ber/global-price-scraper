@@ -1,61 +1,45 @@
 # frozen_string_literal: true
-
 module Rules
-  class EANError < StandardError; end
+  class RuleError < StandardError; end
 
-  # EAN-13 checksum validation
-  def self.valid_ean13?(ean)
-    return false unless ean.match?(/\A\d{13}\z/)
+  def self.validate_market!(market)
+    raise RuleError, "market is required" if market.to_s.empty?
+    raise RuleError, "Unsupported market #{market}" unless Markets::SUPPORTED.include?(market)
+  end
 
-    digits = ean.chars.map(&:to_i)
-    sum = 0
-
-    # indices 0..11 are data, 12 is check digit
-    (0..11).each do |i|
-      sum += (i.even? ? digits[i] : digits[i] * 3)
-    end
-
-    check = (10 - (sum % 10)) % 10
-    check == digits[12]
+  def self.validate_ean_list!(eans)
+    raise RuleError, "Provide 1–10 EANs" if eans.empty? || eans.size > 10
+    eans.each { |e| validate_ean!(e) }
   end
 
   def self.validate_ean!(ean)
-    raise EANError, "EAN must be digits only" unless ean.match?(/\A\d+\z/)
+    s = ean.to_s.strip
+    raise RuleError, "EAN must be digits only: #{ean}" unless s.match?(/\A\d+\z/)
+    raise RuleError, "EAN must be 8, 12, 13, or 14 digits: #{ean}" unless [8,12,13,14].include?(s.length)
 
-    if ean.length == 13
-      raise EANError, "EAN-13 checksum failed (possible typo)" unless valid_ean13?(ean)
-    elsif ean.length == 8
-      # Allow EAN-8 for now (optional to implement checksum later)
-    else
-      raise EANError, "EAN must be 13 digits (EAN-13) or 8 digits (EAN-8)"
-    end
+    # checksum validation for GTIN-8/12/13/14 (common)
+    return true if checksum_valid?(s)
+
+    # Still allow if you want strict? You said strict. So fail:
+    raise RuleError, "EAN checksum invalid (possible typo): #{ean}"
   end
 
-  # Guardrails against bulk/multibuy/promo mechanics contaminating RSV
-  FORBIDDEN_CONTEXT_PATTERNS = [
-    /2\s*(für|for)\s*/i,
-    /3\s*(für|for)\s*/i,
-    /mix\s*&\s*match/i,
-    /mehrkauf/i,
-    /bundle/i,
-    /\bab\b\s*\d/i,
-    /\bfrom\b\s*\d/i
-  ].freeze
-
-  def self.forbidden_context?(text)
-    t = text.to_s
-    FORBIDDEN_CONTEXT_PATTERNS.any? { |re| re.match?(t) }
+  def self.checksum_valid?(digits)
+    ds = digits.chars.map(&:to_i)
+    check = ds.pop
+    # weighting depends on length but standard GTIN uses alternating 3/1 from right
+    sum = 0
+    ds.reverse.each_with_index do |d, idx|
+      sum += d * (idx.even? ? 3 : 1)
+    end
+    calc = (10 - (sum % 10)) % 10
+    calc == check
   end
 
   def self.compute_average(rows)
-    vals = rows
-      .select { |r| r["price_type_flag"] == "Regular" }
-      .select { |r| r["comparable"] == true }
-      .map { |r| r["rsv"] }
-      .compact
-      .map(&:to_f)
-
-    return nil if vals.empty?
-    (vals.sum / vals.size).round(2)
+    comparable = rows.select { |r| r[:flag] == "Comparable" && r[:rsv].is_a?(Numeric) }
+    return [nil, 0] if comparable.empty?
+    avg = comparable.map { |r| r[:rsv] }.sum / comparable.size.to_f
+    [avg.round(2), comparable.size]
   end
 end
