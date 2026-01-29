@@ -1,4 +1,5 @@
 # frozen_string_literal: true
+
 require "sinatra"
 require "json"
 require "dotenv/load"
@@ -9,34 +10,16 @@ require_relative "./lib/extractor"
 require_relative "./lib/rules"
 require_relative "./lib/cache"
 
+# ------------------------------------------------------------
+# Basic server config
+# ------------------------------------------------------------
 set :bind, "0.0.0.0"
 set :port, ENV.fetch("PORT", "3000").to_i
+set :environment, ENV.fetch("RACK_ENV", "development").to_sym
 
-# ----------------------------------------------------
-# Codespaces / Dev: Allow forwarded hosts
-# ----------------------------------------------------
-# Sinatra 4 enables Rack::Protection::HostAuthorization. In Codespaces,
-# the forwarded host is something like: <name>-3000.app.github.dev
-#
-# rack-protection expects OPTIONS AS A HASH (not false), so we configure it.
-#
-configure do
-  if ENV["CODESPACES"] == "true" || settings.environment == :development
-    set :protection, {
-      host_authorization: {
-        permitted_hosts: [
-          /.*\.app\.github\.dev\z/,
-          /.*\.githubpreview\.dev\z/,
-          /.*\.github\.dev\z/,
-          "localhost",
-          "127.0.0.1"
-        ]
-      }
-    }
-  end
-end
-# ----------------------------------------------------
-
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
 helpers do
   def json_body
     request.body.rewind
@@ -47,16 +30,31 @@ helpers do
   end
 end
 
-before do
-  puts "HOST_SEEN=#{request.host} HTTP_HOST=#{request.env['HTTP_HOST']} X_FORWARDED_HOST=#{request.env['HTTP_X_FORWARDED_HOST']}"
+# ------------------------------------------------------------
+# DEBUG: runtime inspection (Step A)
+# ------------------------------------------------------------
+get "/__debug_runtime" do
+  content_type :json
+
+  node_path = `which node 2>/dev/null`.strip
+  npm_path  = `which npm 2>/dev/null`.strip
+
+  {
+    ruby_version: RUBY_VERSION,
+    rack_env: ENV["RACK_ENV"],
+    node_path: node_path.empty? ? nil : node_path,
+    node_version: node_path.empty? ? nil : `node -v 2>/dev/null`.strip,
+    npm_path: npm_path.empty? ? nil : npm_path,
+    npm_version: npm_path.empty? ? nil : `npm -v 2>/dev/null`.strip
+  }.to_json
 end
 
+# ------------------------------------------------------------
+# DEBUG: host inspection (already useful, keep it)
+# ------------------------------------------------------------
 get "/__debug_host" do
   content_type :json
   {
-    rack_env: ENV["RACK_ENV"],
-    sinatra_env: settings.environment.to_s,
-    codespaces: ENV["CODESPACES"],
     host: request.host,
     http_host: request.env["HTTP_HOST"],
     forwarded_host: request.env["HTTP_X_FORWARDED_HOST"],
@@ -64,10 +62,16 @@ get "/__debug_host" do
   }.to_json
 end
 
+# ------------------------------------------------------------
+# UI
+# ------------------------------------------------------------
 get "/" do
   erb :index
 end
 
+# ------------------------------------------------------------
+# Main scrape endpoint
+# ------------------------------------------------------------
 post "/scrape" do
   content_type :json
   body = json_body
@@ -86,11 +90,13 @@ post "/scrape" do
   results = eans.map do |ean|
     Rules.validate_ean!(ean)
 
+    # 🚨 cache key bumped to v2 to avoid frozen bad results
     cache_key = "scrape:v2:#{market}:#{ean}"
     cached = cache.get(cache_key)
     next cached.merge("cached" => true) if cached
 
     urls = serp.discover_urls(market: market, ean: ean)
+
     rows, discards, master = extractor.scrape_urls(
       market: market,
       ean: ean,
@@ -107,7 +113,11 @@ post "/scrape" do
       "cached" => false
     }
 
-    cache.set(cache_key, out)
+    # ❗ cache only non-runtime-failure results
+    unless discards.any? { |d| d["reason"].include?("No such file or directory - node") }
+      cache.set(cache_key, out)
+    end
+
     out
   rescue Rules::EANError => e
     {
