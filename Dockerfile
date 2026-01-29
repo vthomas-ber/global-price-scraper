@@ -1,25 +1,32 @@
-FROM mcr.microsoft.com/playwright:v1.45.0-jammy
+FROM ruby:3.3.5-slim
 
-# Install prerequisites
-RUN apt-get update && apt-get install -y \
-  curl gnupg build-essential libsqlite3-dev \
+# System dependencies
+RUN apt-get update -y && apt-get install -y \
+  curl \
+  ca-certificates \
+  git \
+  build-essential \
+  libsqlite3-dev \
+  chromium \
+  chromium-driver \
   && rm -rf /var/lib/apt/lists/*
 
-# Install Ruby 3.4 via ruby-build (reliable and version-pinned)
-RUN curl -fsSL https://github.com/rbenv/ruby-build/archive/refs/tags/v20241225.tar.gz \
-  | tar xz -C /tmp \
-  && /tmp/ruby-build-20241225/install.sh \
-  && ruby-build 3.4.7 /usr/local \
-  && rm -rf /tmp/ruby-build-20241225
+# Playwright needs this
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 
 WORKDIR /app
 
-COPY Gemfile /app/
-RUN gem install bundler && bundle install
+# Ruby deps
+COPY Gemfile Gemfile.lock ./
+RUN bundle install --without development test
 
-COPY . /app/
+# App
+COPY . .
 
+# Render sets PORT automatically
 ENV RACK_ENV=production
-ENV PORT=3000
 
-CMD ["bundle", "exec", "puma", "-p", "3000", "-e", "production", "config.ru"]
+EXPOSE 3000
+
+CMD ["bundle", "exec", "ruby", "app.rb"]
