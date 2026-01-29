@@ -1,0 +1,11 @@
+{
+  "name": "global-price-scraper",
+  "forwardPorts": [3000],
+  "portsAttributes": {
+    "3000": {
+      "label": "Sinatra",
+      "onAutoForward": "openBrowser",
+      "visibility": "public"
+    }
+  }
+}

@@ -1,0 +1,59 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Global Price Scraper</title>
+  <style>
+    body { font-family: system-ui, -apple-system; margin: 24px; }
+    input, textarea, select, button { font-size: 14px; padding: 8px; }
+    textarea { width: 560px; height: 120px; }
+    pre { background: #f6f6f6; padding: 12px; overflow: auto; border-radius: 8px; }
+  </style>
+</head>
+<body>
+  <h2>Global Price Scraper (MVP)</h2>
+  <p>Enter up to 10 EANs. Output is JSON.</p>
+
+  <form id="f">
+    <label>Market:</label>
+    <select id="market">
+      <option>DE</option>
+      <option>NL</option>
+      <option>BE</option>
+      <option>UK</option>
+      <option>FR</option>
+      <option>DK</option>
+      <option>IT</option>
+      <option>ES</option>
+      <option>PL</option>
+      <option>PT</option>
+      <option>SE</option>
+      <option>NO</option>
+    </select>
+    <br/><br/>
+    <label>EANs (one per line, max 10)</label><br/>
+    <textarea id="eans"></textarea><br/>
+    <button type="submit">Scrape</button>
+  </form>
+
+  <h3>Result</h3>
+  <pre id="out"></pre>
+
+  <script>
+    document.getElementById("f").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const market = document.getElementById("market").value.trim();
+      const eans = document.getElementById("eans").value
+        .split("\n").map(x => x.trim()).filter(Boolean).slice(0, 10);
+
+      const res = await fetch("/scrape", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ market, eans })
+      });
+
+      document.getElementById("out").textContent = await res.text();
+    });
+  </script>
+</body>
+</html>

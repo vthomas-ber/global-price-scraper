@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: global-price-scraper
+    env: docker
+    plan: starter
+    autoDeploy: true
+    envVars:
+      - key: SERPAPI_KEY
+        sync: false
+      - key: CACHE_DB
+        value: /tmp/cache.sqlite3
+      - key: PW_TIMEOUT_MS
+        value: "20000"
+      - key: PW_LOCALE
+        value: "de-DE"
