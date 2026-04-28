@@ -1,16 +1,13 @@
 services:
   - type: web
-    name: global-price-scraper
-    env: ruby
-    plan: starter
-    buildCommand: bundle install
-    startCommand: bundle exec rackup -o 0.0.0.0 -p $PORT
+    name: ean-price-scraper
+    env: python
+    buildCommand: "./build.sh"
+    startCommand: "uvicorn main:app --host 0.0.0.0 --port $PORT"
     envVars:
-      - key: RACK_ENV
-        value: production
-      - key: SERPAPI_KEY
+      - key: SERPER_API_KEY
+        sync: false
+      - key: EAN_SEARCH_API_KEY
         sync: false
       - key: GEMINI_API_KEY
-        sync: false
-      - key: EANSEARCH_API_KEY
         sync: false
