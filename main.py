@@ -33,19 +33,24 @@ class ScrapeRequest(BaseModel):
     eans: list[str]
 
 # --- 1. The "Eyes": Serper API (Phase 1 & 2) ---
+# --- 1. The "Eyes": Serper API (Phase 1 & 2) ---
 async def search_for_product_urls(ean: str, market_code: str) -> list[str]:
     if not SERPER_API_KEY:
+        print("Error: Missing SERPER_API_KEY")
         return []
     
     url = "https://google.serper.dev/search"
-    # Mapping market to golden websites (Example mapping)
+    
+    # ADDED PARENTHESES: Fixes Google's logic for "OR" operators
     golden_sites = {
-        "UK": "site:tesco.com OR site:sainsburys.co.uk OR site:asda.com OR site:morrisons.com",
-        "FR": "site:carrefour.fr OR site:auchan.fr OR site:coursesu.com",
-        "DE": "site:rewe.de OR site:edeka.de OR site:kaufland.de"
+        "UK": "(site:tesco.com OR site:sainsburys.co.uk OR site:asda.com OR site:morrisons.com)",
+        "FR": "(site:carrefour.fr OR site:auchan.fr OR site:coursesu.com)",
+        "DE": "(site:rewe.de OR site:edeka.de OR site:kaufland.de)"
     }
     
     sites_query = golden_sites.get(market_code.upper(), "")
+    
+    # Phase 1 Query
     query = f'"{ean}" {sites_query}'.strip()
     
     payload = json.dumps({
@@ -59,10 +64,25 @@ async def search_for_product_urls(ean: str, market_code: str) -> list[str]:
     
     async with httpx.AsyncClient() as client:
         try:
+            # Phase 1: Try Golden Sites First
             response = await client.post(url, headers=headers, data=payload)
             results = response.json()
             urls = [item["link"] for item in results.get("organic", [])]
+            
+            # Phase 2 Fallback: If 0 results, search the whole country for the EAN + grocery keywords
+            if not urls:
+                print(f"Phase 1 failed for {ean}, trying Phase 2...")
+                broad_query = f'"{ean}" grocery OR supermarket OR food'
+                payload_broad = json.dumps({
+                  "q": broad_query,
+                  "gl": market_code.lower() 
+                })
+                response_broad = await client.post(url, headers=headers, data=payload_broad)
+                results_broad = response_broad.json()
+                urls = [item["link"] for item in results_broad.get("organic", [])]
+
             return urls
+            
         except Exception as e:
             print(f"Serper search failed: {e}")
             return []
