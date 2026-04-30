@@ -21,7 +21,8 @@ else:
 
 app = FastAPI()
 
-# Mount static files for the frontend
+# Bulletproof folder creation
+os.makedirs("static", exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 @app.get("/")
@@ -32,97 +33,75 @@ class ScrapeRequest(BaseModel):
     market: str
     eans: list[str]
 
-# --- 1. The "Eyes": Serper API (Phase 1 & 2) ---
-# --- 1. The "Eyes": Serper API (Phase 1 & 2) ---
-async def search_for_product_urls(ean: str, market_code: str) -> list[str]:
+# --- HELPER: Serper API Search ---
+async def run_serper_search(query: str, market_code: str) -> list[str]:
     if not SERPER_API_KEY:
-        print("Error: Missing SERPER_API_KEY")
         return []
-    
     url = "https://google.serper.dev/search"
-    
-    # ADDED PARENTHESES: Fixes Google's logic for "OR" operators
-    golden_sites = {
-        "UK": "(site:tesco.com OR site:sainsburys.co.uk OR site:asda.com OR site:morrisons.com)",
-        "FR": "(site:carrefour.fr OR site:auchan.fr OR site:coursesu.com)",
-        "DE": "(site:rewe.de OR site:edeka.de OR site:kaufland.de)"
-    }
-    
-    sites_query = golden_sites.get(market_code.upper(), "")
-    
-    # Phase 1 Query
-    query = f'"{ean}" {sites_query}'.strip()
-    
-    payload = json.dumps({
-      "q": query,
-      "gl": market_code.lower() 
-    })
-    headers = {
-      'X-API-KEY': SERPER_API_KEY,
-      'Content-Type': 'application/json'
-    }
+    payload = json.dumps({"q": query, "gl": market_code.lower()})
+    headers = {'X-API-KEY': SERPER_API_KEY, 'Content-Type': 'application/json'}
     
     async with httpx.AsyncClient() as client:
         try:
-            # Phase 1: Try Golden Sites First
             response = await client.post(url, headers=headers, data=payload)
             results = response.json()
-            urls = [item["link"] for item in results.get("organic", [])]
-            
-            # Phase 2 Fallback: If 0 results, search the whole country for the EAN + grocery keywords
-            if not urls:
-                print(f"Phase 1 failed for {ean}, trying Phase 2...")
-                broad_query = f'"{ean}" grocery OR supermarket OR food'
-                payload_broad = json.dumps({
-                  "q": broad_query,
-                  "gl": market_code.lower() 
-                })
-                response_broad = await client.post(url, headers=headers, data=payload_broad)
-                results_broad = response_broad.json()
-                urls = [item["link"] for item in results_broad.get("organic", [])]
-
-            return urls
-            
-        except Exception as e:
-            print(f"Serper search failed: {e}")
+            return [item["link"] for item in results.get("organic", [])]
+        except Exception:
             return []
 
-# --- 2. The Scraper: Playwright ---
+# --- PHASE 2.5: EAN-Search API Lookup ---
+async def lookup_ean_name(ean: str) -> str:
+    if not EAN_SEARCH_API_KEY:
+        return ""
+    # Using ean-search.org API format. 
+    url = f"https://api.ean-search.org/api?token={EAN_SEARCH_API_KEY}&op=barcode-lookup&ean={ean}"
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(url)
+            data = response.json()
+            if isinstance(data, list) and len(data) > 0 and "name" in data[0]:
+                return data[0]["name"]
+            return ""
+        except Exception:
+            return ""
+
+# --- THE SCRAPER: Playwright ---
 async def scrape_page_text(url: str) -> str:
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
         try:
-            # Block resources to speed up scraping
             await page.route("**/*", lambda route: route.abort() 
                 if route.request.resource_type in ["image", "media", "font", "stylesheet"] 
                 else route.continue_())
             await page.goto(url, wait_until="domcontentloaded", timeout=15000)
-            text_content = await page.evaluate("document.body.innerText")
-            return text_content
-        except Exception as e:
-            print(f"Scraping failed for {url}: {e}")
+            return await page.evaluate("document.body.innerText")
+        except Exception:
             return ""
         finally:
             await browser.close()
 
-# --- 3. The "Brain": Gemini Extraction ---
-def extract_price_data(raw_text: str, ean: str, url: str) -> dict:
+# --- THE BRAIN: Gemini Extraction ---
+def extract_price_data(raw_text: str, ean: str, product_name: str, url: str, is_name_match: bool) -> dict:
     if not model:
         return {"error": "Gemini API key not configured."}
         
+    match_flag = "[Name Match Only]" if is_name_match else "Regular"
+    
     prompt = f"""
-    You are an expert retail data extractor following strict rules for Ambient Food items.
+    You are an expert retail data extractor for Ambient Food items.
     
     TARGET EAN: {ean}
+    DISCOVERED PRODUCT NAME: {product_name if product_name else "Unknown"}
     SOURCE URL: {url}
     
-    Examine the raw text below and extract the Regular Selling Value (RSV) consumer price.
+    Examine the raw text below and extract the pricing data.
     Rules:
-    1. Verify explicit EAN match or strict Double Match (Brand + Weight/Size + Name/Variant).
-    2. Extract non-promotional price. If only promo exists, mark RSV empty and flag 'Promo-only'.
+    1. Verify explicit EAN match OR strict Double Match (Brand + Weight + Variant) using the Discovered Product Name.
+    2. Extract non-promotional Regular Selling Value (RSV). If only promo exists, RSV is empty and flag is 'Promo-only'.
     3. Ignore wholesale or 'from' prices.
     4. Provide VAT info as 'incl. VAT (rate shown: X%)' OR 'incl. VAT (rate not stated)'.
+    5. Price type flag should default to '{match_flag}' unless it is Promo-only or Clearance.
     
     Return ONLY JSON with these exact keys: 
     "vendor_name", "currency", "rsv_incl_vat", "vat_info", "promo_price", "price_type_flag", "pack_format", "per_unit_rsv".
@@ -131,14 +110,13 @@ def extract_price_data(raw_text: str, ean: str, url: str) -> dict:
     RAW TEXT (Truncated):
     {raw_text[:10000]}
     """
-    
     try:
         response = model.generate_content(prompt, generation_config={"response_mime_type": "application/json"})
         return json.loads(response.text)
     except Exception as e:
         return {"error": f"Failed to parse LLM response: {str(e)}"}
 
-# --- 4. Main Endpoint Orchestration ---
+# --- MAIN ORCHESTRATOR (PHASES 1 -> 4) ---
 @app.post("/scrape")
 async def run_scraper(request: ScrapeRequest):
     if len(request.eans) > 10:
@@ -146,13 +124,36 @@ async def run_scraper(request: ScrapeRequest):
         
     final_results = {}
     
+    golden_sites = {
+        "UK": "(site:tesco.com OR site:sainsburys.co.uk OR site:asda.com OR site:morrisons.com OR site:iceland.co.uk OR site:waitrose.com)",
+        "FR": "(site:carrefour.fr OR site:auchan.fr OR site:coursesu.com OR site:intermarche.com)",
+        "DE": "(site:rewe.de OR site:edeka.de OR site:kaufland.de)"
+    }
+    
     for ean in request.eans:
-        urls = await search_for_product_urls(ean, request.market)
+        sites_query = golden_sites.get(request.market.upper(), "")
         
+        # PHASE 1 & 2: Search by EAN
+        urls = await run_serper_search(f'"{ean}" {sites_query}', request.market)
         if not urls:
-            final_results[ean] = {"status": "No data found", "error": "No URLs found via search.", "source_url": ""}
+            urls = await run_serper_search(f'"{ean}" grocery OR supermarket', request.market)
+        
+        product_name = ""
+        is_name_match = False
+        
+        # PHASE 2.5 & 4: If no URLs, lookup Name and search by Name
+        if not urls:
+            product_name = await lookup_ean_name(ean)
+            if product_name:
+                is_name_match = True
+                urls = await run_serper_search(f'"{product_name}" {sites_query}', request.market)
+        
+        # If STILL no URLs after all phases
+        if not urls:
+            final_results[ean] = {"status": "No data found", "error": "No URLs found after EAN and Name search.", "source_url": ""}
             continue
             
+        # SCRAPE & EXTRACT (Taking the top URL for now)
         target_url = urls[0]
         page_text = await scrape_page_text(target_url)
         
@@ -160,7 +161,7 @@ async def run_scraper(request: ScrapeRequest):
             final_results[ean] = {"status": "Scraping failed or blocked", "source_url": target_url}
             continue
             
-        extracted_data = extract_price_data(page_text, ean, target_url)
+        extracted_data = extract_price_data(page_text, ean, product_name, target_url, is_name_match)
         extracted_data["source_url"] = target_url
         
         final_results[ean] = extracted_data
