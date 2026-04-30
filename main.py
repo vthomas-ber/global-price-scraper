@@ -14,7 +14,17 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel('gemini-3.0-flash-preview') # Or 'gemini-3.0-flash' depending on your exact access
+    
+    # --- BULLETPROOF MODEL SELECTOR ---
+    # Asks Google's servers what models your specific key has access to
+    available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+    flash_models = [name for name in available_models if 'flash' in name.lower()]
+    
+    # Pick the newest flash model available (or fallback to the first valid one)
+    chosen_model = flash_models[-1] if flash_models else available_models[0]
+    print(f"Automatically selected model: {chosen_model}")
+    
+    model = genai.GenerativeModel(chosen_model)
 else:
     model = None
 
