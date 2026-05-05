@@ -14,7 +14,7 @@ logger = logging.getLogger("price-scraper")
 
 # --- Configuration ---
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
 
 # Try importing google-genai SDK; fall back to REST API if unavailable
 try:
