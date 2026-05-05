@@ -2,12 +2,11 @@ import os
 import json
 import asyncio
 import logging
+import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from google import genai
-from google.genai import types
 
 # --- Logging ---
 logging.basicConfig(level=logging.INFO)
@@ -16,6 +15,16 @@ logger = logging.getLogger("price-scraper")
 # --- Configuration ---
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+# Try importing google-genai SDK; fall back to REST API if unavailable
+try:
+    from google import genai
+    from google.genai import types
+    HAS_SDK = True
+    logger.info("google-genai SDK loaded")
+except ImportError:
+    HAS_SDK = False
+    logger.info("google-genai SDK not found, using REST API")
 
 app = FastAPI()
 
@@ -173,7 +182,7 @@ def parse_gemini_json(text: str) -> dict:
     # Find outermost JSON object
     start = cleaned.find("{")
     if start < 0:
-        raise ValueError("No JSON object found in response")
+        raise ValueError(f"No JSON object found. Text starts with: {cleaned[:200]}")
 
     # Find matching closing brace
     depth = 0
@@ -185,51 +194,153 @@ def parse_gemini_json(text: str) -> dict:
             if depth == 0:
                 return json.loads(cleaned[start:i + 1])
 
-    # Fallback: try rfind
     end = cleaned.rfind("}") + 1
     if end > start:
         return json.loads(cleaned[start:end])
 
-    raise ValueError("Could not extract valid JSON")
+    raise ValueError(f"Could not extract valid JSON. Text: {cleaned[:300]}")
 
 
-def extract_text_from_response(response) -> str:
-    """Extract text from Gemini response, handling all possible structures."""
-    # Method 1: Direct .text accessor
+async def call_gemini_rest(ean: str, market: str, prompt: str) -> dict:
+    """Call Gemini via REST API directly — more reliable than SDK for grounded search."""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "tools": [{"google_search": {}}],
+        "generationConfig": {"temperature": 0.1}
+    }
+
+    params = {"key": GEMINI_API_KEY}
+
+    async with httpx.AsyncClient() as client:
+        logger.info(f"[{ean}] REST API call to {GEMINI_MODEL}...")
+        res = await client.post(url, json=payload, params=params, timeout=120.0)
+
+        if res.status_code != 200:
+            error_text = res.text[:500]
+            logger.error(f"[{ean}] REST API error {res.status_code}: {error_text}")
+            raise Exception(f"Gemini API {res.status_code}: {error_text}")
+
+        data = res.json()
+
+        # Extract text from response
+        text_parts = []
+        candidates = data.get("candidates", [])
+        if not candidates:
+            logger.warning(f"[{ean}] No candidates in response")
+            raise Exception("No candidates in Gemini response")
+
+        candidate = candidates[0]
+        content = candidate.get("content", {})
+        parts = content.get("parts", [])
+
+        for part in parts:
+            if "text" in part:
+                text_parts.append(part["text"])
+
+        response_text = "\n".join(text_parts)
+
+        if not response_text:
+            # Log what we got for debugging
+            finish_reason = candidate.get("finishReason", "unknown")
+            grounding = candidate.get("groundingMetadata", {})
+            queries = grounding.get("webSearchQueries", [])
+            logger.warning(f"[{ean}] Empty text. finish={finish_reason}, queries={queries}")
+            raise Exception(f"Empty response (finish={finish_reason}, searched={len(queries)} queries)")
+
+        logger.info(f"[{ean}] Got {len(response_text)} chars from REST API")
+
+        # Extract grounding URLs
+        grounding_urls = []
+        grounding_meta = candidate.get("groundingMetadata", {})
+        for chunk in grounding_meta.get("groundingChunks", []):
+            web = chunk.get("web", {})
+            if web.get("uri"):
+                grounding_urls.append(web["uri"])
+
+        search_queries = grounding_meta.get("webSearchQueries", [])
+        if search_queries:
+            logger.info(f"[{ean}] Gemini searched: {search_queries}")
+
+        return {
+            "text": response_text,
+            "grounding_urls": grounding_urls
+        }
+
+
+async def call_gemini_sdk(ean: str, market: str, prompt: str) -> dict:
+    """Call Gemini via the Python SDK."""
+    client = genai.Client(api_key=GEMINI_API_KEY)
+
+    config = types.GenerateContentConfig(
+        tools=[types.Tool(google_search=types.GoogleSearch())],
+        temperature=0.1,
+    )
+
+    def _call():
+        return client.models.generate_content(
+            model=GEMINI_MODEL, contents=prompt, config=config,
+        )
+
+    logger.info(f"[{ean}] SDK call to {GEMINI_MODEL}...")
+    response = await asyncio.get_event_loop().run_in_executor(None, _call)
+
+    # Try multiple methods to extract text
+    response_text = ""
+
+    # Method 1: .text accessor
     try:
         if response.text:
-            return response.text
+            response_text = response.text
     except (AttributeError, ValueError):
         pass
 
-    # Method 2: Dig into candidates → content → parts
-    try:
-        if response.candidates:
-            for candidate in response.candidates:
-                if hasattr(candidate, 'content') and candidate.content:
-                    if hasattr(candidate.content, 'parts') and candidate.content.parts:
-                        texts = []
-                        for part in candidate.content.parts:
-                            if hasattr(part, 'text') and part.text:
-                                texts.append(part.text)
-                        if texts:
-                            return "\n".join(texts)
-    except (AttributeError, IndexError):
-        pass
+    # Method 2: dig into parts
+    if not response_text:
+        try:
+            if response.candidates:
+                for candidate in response.candidates:
+                    if hasattr(candidate, 'content') and candidate.content:
+                        if hasattr(candidate.content, 'parts') and candidate.content.parts:
+                            for part in candidate.content.parts:
+                                if hasattr(part, 'text') and part.text:
+                                    response_text += part.text
+        except Exception:
+            pass
 
-    # Method 3: Try to serialize the whole response
+    if not response_text:
+        finish = "unknown"
+        try:
+            finish = str(response.candidates[0].finish_reason) if response.candidates else "no_candidates"
+        except Exception:
+            pass
+        raise Exception(f"Empty SDK response (finish={finish})")
+
+    logger.info(f"[{ean}] Got {len(response_text)} chars from SDK")
+
+    # Extract grounding URLs
+    grounding_urls = []
     try:
-        raw = str(response)
-        if "{" in raw and "}" in raw:
-            return raw
+        if response.candidates and response.candidates[0].grounding_metadata:
+            gm = response.candidates[0].grounding_metadata
+            if hasattr(gm, 'grounding_chunks') and gm.grounding_chunks:
+                for chunk in gm.grounding_chunks:
+                    if hasattr(chunk, 'web') and chunk.web and hasattr(chunk.web, 'uri'):
+                        grounding_urls.append(chunk.web.uri)
+            if hasattr(gm, 'web_search_queries') and gm.web_search_queries:
+                logger.info(f"[{ean}] Gemini searched: {gm.web_search_queries}")
     except Exception:
         pass
 
-    return ""
+    return {
+        "text": response_text,
+        "grounding_urls": grounding_urls
+    }
 
 
-async def call_gemini_for_ean(ean: str, market: str, max_retries: int = 2) -> dict:
-    """Call Gemini API with Google Search grounding to scrape price for one EAN."""
+async def call_gemini_for_ean(ean: str, market: str) -> dict:
+    """Call Gemini with retries, trying REST API first (more reliable for grounding)."""
     empty_result = {
         "ean": ean, "status": "error",
         "prices": [], "master_data": {"brand": "", "product_name": "", "pack_format": ""}
@@ -240,79 +351,26 @@ async def call_gemini_for_ean(ean: str, market: str, max_retries: int = 2) -> di
         return empty_result
 
     prompt = build_scrape_prompt(ean, market)
-    client = genai.Client(api_key=GEMINI_API_KEY)
 
-    for attempt in range(max_retries + 1):
+    # Try REST API first (most reliable), then SDK as fallback
+    methods = [
+        ("REST", lambda: call_gemini_rest(ean, market, prompt)),
+    ]
+    if HAS_SDK:
+        methods.append(("SDK", lambda: call_gemini_sdk(ean, market, prompt)))
+
+    last_error = None
+    for method_name, method_fn in methods:
         try:
-            # First attempt: with Google Search grounding
-            # On retry: try without grounding (sometimes grounding causes empty responses)
-            if attempt == 0:
-                config = types.GenerateContentConfig(
-                    tools=[types.Tool(google_search=types.GoogleSearch())],
-                    temperature=0.1,
-                )
-                logger.info(f"[{ean}] Attempt {attempt + 1}: with Google Search grounding")
-            else:
-                config = types.GenerateContentConfig(
-                    tools=[types.Tool(google_search=types.GoogleSearch())],
-                    temperature=0.2 + (attempt * 0.1),
-                )
-                logger.info(f"[{ean}] Attempt {attempt + 1}: retry with temp={0.2 + (attempt * 0.1)}")
-
-            def _call():
-                return client.models.generate_content(
-                    model=GEMINI_MODEL,
-                    contents=prompt,
-                    config=config,
-                )
-
-            response = await asyncio.get_event_loop().run_in_executor(None, _call)
-
-            # Extract text using robust method
-            response_text = extract_text_from_response(response)
-
-            if not response_text:
-                logger.warning(f"[{ean}] Attempt {attempt + 1}: Empty response text")
-                # Log what we did get for debugging
-                try:
-                    if response.candidates:
-                        c = response.candidates[0]
-                        logger.warning(f"[{ean}] finish_reason: {c.finish_reason}")
-                        if hasattr(c, 'grounding_metadata') and c.grounding_metadata:
-                            gm = c.grounding_metadata
-                            if hasattr(gm, 'web_search_queries') and gm.web_search_queries:
-                                logger.info(f"[{ean}] Search queries executed: {gm.web_search_queries}")
-                except Exception as e:
-                    logger.warning(f"[{ean}] Could not inspect response: {e}")
-
-                if attempt < max_retries:
-                    await asyncio.sleep(1 + attempt)  # Brief backoff
-                    continue
-                else:
-                    empty_result["error"] = "Empty response from Gemini after all retries"
-                    return empty_result
-
-            logger.info(f"[{ean}] Got response text ({len(response_text)} chars)")
-            logger.debug(f"[{ean}] Response preview: {response_text[:200]}")
+            raw = await method_fn()
+            response_text = raw["text"]
+            grounding_urls = raw.get("grounding_urls", [])
 
             # Parse JSON
             result = parse_gemini_json(response_text)
             result["ean"] = ean
 
-            # Enrich source URLs from grounding metadata
-            grounding_urls = []
-            try:
-                if response.candidates and response.candidates[0].grounding_metadata:
-                    gm = response.candidates[0].grounding_metadata
-                    if hasattr(gm, 'grounding_chunks') and gm.grounding_chunks:
-                        for chunk in gm.grounding_chunks:
-                            if hasattr(chunk, 'web') and chunk.web and hasattr(chunk.web, 'uri'):
-                                grounding_urls.append(chunk.web.uri)
-                    if hasattr(gm, 'web_search_queries') and gm.web_search_queries:
-                        logger.info(f"[{ean}] Grounding searches: {gm.web_search_queries}")
-            except Exception:
-                pass
-
+            # Enrich missing source URLs from grounding metadata
             if grounding_urls and result.get("prices"):
                 for price_entry in result["prices"]:
                     if not price_entry.get("source_url"):
@@ -323,26 +381,17 @@ async def call_gemini_for_ean(ean: str, market: str, max_retries: int = 2) -> di
                                 break
 
             price_count = len(result.get("prices", []))
-            logger.info(f"[{ean}] Success: status={result.get('status')}, prices={price_count}")
+            logger.info(f"[{ean}] ✅ {method_name}: status={result.get('status')}, prices={price_count}")
             return result
 
-        except json.JSONDecodeError as e:
-            logger.error(f"[{ean}] Attempt {attempt + 1}: JSON parse error: {e}")
-            if attempt < max_retries:
-                await asyncio.sleep(1)
-                continue
-            empty_result["error"] = f"JSON parse error: {str(e)}"
-            return empty_result
-
         except Exception as e:
-            logger.error(f"[{ean}] Attempt {attempt + 1}: Error: {e}")
-            if attempt < max_retries:
-                await asyncio.sleep(1)
-                continue
-            empty_result["error"] = str(e)
-            return empty_result
+            last_error = str(e)
+            logger.warning(f"[{ean}] {method_name} failed: {last_error}")
+            await asyncio.sleep(1)
+            continue
 
-    empty_result["error"] = "All retries exhausted"
+    empty_result["error"] = f"All methods failed. Last: {last_error}"
+    logger.error(f"[{ean}] ❌ All methods failed: {last_error}")
     return empty_result
 
 
@@ -423,80 +472,69 @@ async def run_scraper(request: ScrapeRequest):
 
 @app.get("/health")
 async def health():
-    """Health check — also verifies Gemini API key works."""
+    """Health check — verifies Gemini API key works via REST."""
     if not GEMINI_API_KEY:
         return {"status": "error", "detail": "GEMINI_API_KEY not set"}
     try:
-        client = genai.Client(api_key=GEMINI_API_KEY)
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents="Reply with exactly: OK",
-            config=types.GenerateContentConfig(temperature=0),
-        )
-        return {
-            "status": "ok",
-            "model": GEMINI_MODEL,
-            "test_response": extract_text_from_response(response)[:50]
-        }
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+        payload = {"contents": [{"parts": [{"text": "Reply with exactly: OK"}]}]}
+        async with httpx.AsyncClient() as client:
+            res = await client.post(url, json=payload, params={"key": GEMINI_API_KEY}, timeout=15.0)
+            if res.status_code != 200:
+                return {"status": "error", "model": GEMINI_MODEL, "http_code": res.status_code, "detail": res.text[:300]}
+            data = res.json()
+            text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+            return {"status": "ok", "model": GEMINI_MODEL, "test_response": text[:50]}
     except Exception as e:
         return {"status": "error", "detail": str(e)}
 
 
 @app.get("/debug/{ean}")
 async def debug_ean(ean: str, market: str = "UK"):
-    """Debug endpoint — shows raw Gemini response for a single EAN."""
+    """Debug endpoint — shows raw Gemini REST response for a single EAN."""
     if not GEMINI_API_KEY:
         return {"error": "No API key"}
 
-    client = genai.Client(api_key=GEMINI_API_KEY)
     prompt = build_scrape_prompt(ean, market.upper())
-
-    config = types.GenerateContentConfig(
-        tools=[types.Tool(google_search=types.GoogleSearch())],
-        temperature=0.1,
-    )
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "tools": [{"google_search": {}}],
+        "generationConfig": {"temperature": 0.1}
+    }
 
     try:
-        response = client.models.generate_content(
-            model=GEMINI_MODEL, contents=prompt, config=config
-        )
+        async with httpx.AsyncClient() as client:
+            res = await client.post(url, json=payload, params={"key": GEMINI_API_KEY}, timeout=120.0)
 
-        # Gather everything we can about the response
         debug_info = {
             "model": GEMINI_MODEL,
-            "text_via_accessor": None,
-            "text_via_parts": None,
-            "finish_reason": None,
-            "grounding_queries": None,
-            "grounding_chunk_count": 0,
+            "http_status": res.status_code,
         }
 
-        try:
-            debug_info["text_via_accessor"] = response.text[:500] if response.text else None
-        except Exception as e:
-            debug_info["text_via_accessor_error"] = str(e)
+        if res.status_code != 200:
+            debug_info["error"] = res.text[:500]
+            return debug_info
 
-        try:
-            if response.candidates:
-                c = response.candidates[0]
-                debug_info["finish_reason"] = str(c.finish_reason)
-                if c.content and c.content.parts:
-                    parts_text = [p.text for p in c.content.parts if hasattr(p, 'text') and p.text]
-                    debug_info["text_via_parts"] = parts_text[0][:500] if parts_text else None
-                    debug_info["parts_count"] = len(c.content.parts)
-                if c.grounding_metadata:
-                    gm = c.grounding_metadata
-                    if hasattr(gm, 'web_search_queries'):
-                        debug_info["grounding_queries"] = gm.web_search_queries
-                    if hasattr(gm, 'grounding_chunks') and gm.grounding_chunks:
-                        debug_info["grounding_chunk_count"] = len(gm.grounding_chunks)
-        except Exception as e:
-            debug_info["inspection_error"] = str(e)
+        data = res.json()
+        candidates = data.get("candidates", [])
+        debug_info["candidate_count"] = len(candidates)
 
-        # Also try full extraction
-        full_text = extract_text_from_response(response)
-        debug_info["extracted_text_length"] = len(full_text) if full_text else 0
-        debug_info["extracted_text_preview"] = full_text[:500] if full_text else None
+        if candidates:
+            c = candidates[0]
+            debug_info["finish_reason"] = c.get("finishReason", "unknown")
+
+            parts = c.get("content", {}).get("parts", [])
+            debug_info["parts_count"] = len(parts)
+
+            text_parts = [p["text"] for p in parts if "text" in p]
+            full_text = "\n".join(text_parts)
+            debug_info["text_length"] = len(full_text)
+            debug_info["text_preview"] = full_text[:800] if full_text else None
+
+            gm = c.get("groundingMetadata", {})
+            debug_info["search_queries"] = gm.get("webSearchQueries", [])
+            debug_info["grounding_chunks"] = len(gm.get("groundingChunks", []))
 
         return debug_info
 
