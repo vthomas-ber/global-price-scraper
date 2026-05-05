@@ -1,219 +1,334 @@
 import os
 import json
-import httpx
-import re
+import asyncio
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from playwright.async_api import async_playwright
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
-# --- API Keys Configuration ---
-SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY", "")
+# --- Configuration ---
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    # Automatically finds the best flash model your key has access to
-    available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-    flash_models = [name for name in available_models if 'flash' in name.lower()]
-    chosen_model = flash_models[-1] if flash_models else available_models[0]
-    model = genai.GenerativeModel(chosen_model)
-else:
-    model = None
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 app = FastAPI()
 
 os.makedirs("static", exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+
 @app.get("/")
 async def read_index():
     return FileResponse("static/index.html")
+
 
 class ScrapeRequest(BaseModel):
     market: str
     eans: list[str]
 
-# --- SERPAPI SEARCH ENGINES ---
-async def run_serpapi_organic(query: str, market_code: str) -> list:
-    if not SERPAPI_API_KEY: return []
-    url = "https://serpapi.com/search"
-    params = {"api_key": SERPAPI_API_KEY, "engine": "google", "q": query, "gl": market_code.lower(), "hl": "en"}
-    async with httpx.AsyncClient() as client:
-        try:
-            res = await client.get(url, params=params, timeout=15.0)
-            return res.json().get("organic_results", [])
-        except Exception:
-            return []
 
-async def run_serpapi_shopping(query: str, market_code: str) -> dict:
-    if not SERPAPI_API_KEY: return None
-    url = "https://serpapi.com/search"
-    params = {"api_key": SERPAPI_API_KEY, "engine": "google_shopping", "q": query, "gl": market_code.lower(), "hl": "en"}
-    async with httpx.AsyncClient() as client:
-        try:
-            res = await client.get(url, params=params, timeout=15.0)
-            results = res.json().get("shopping_results", [])
-            if results:
-                # Grab the top Google Shopping result
-                best = results[0] 
-                return {
-                    "vendor_name": best.get("source", "Google Shopping"),
-                    "currency": best.get("currency", ""),
-                    "rsv_incl_vat": str(best.get("extracted_price", best.get("price", ""))),
-                    "vat_info": "incl. VAT (rate not stated)",
-                    "promo_price": "",
-                    "price_type_flag": "Google Shopping Match",
-                    "pack_format": "",
-                    "source_url": best.get("link", "")
-                }
-        except Exception:
-            pass
-    return None
+# --- Golden Website Registry ---
+GOLDEN_SITES = {
+    "FR": ["carrefour.fr", "auchan.fr", "coursesu.com", "intermarche.com", "monoprix.fr", "franprix.fr"],
+    "UK": ["tesco.com", "sainsburys.co.uk", "asda.com", "morrisons.com", "iceland.co.uk", "waitrose.com"],
+    "NL": ["ah.nl", "jumbo.com", "plus.nl", "dirk.nl", "vomar.nl"],
+    "BE": ["delhaize.be", "colruyt.be", "carrefour.be", "ah.be"],
+    "DE": ["rewe.de", "edeka.de", "kaufland.de", "dm.de", "rossmann.de"],
+    "DK": ["nemlig.com", "bilkatogo.dk", "rema1000.dk", "netto.dk"],
+    "IT": ["carrefour.it", "conad.it", "esselunga.it", "coop.it"],
+    "ES": ["carrefour.es", "mercadona.es", "dia.es", "alcampo.es"],
+    "SE": ["ica.se", "coop.se", "willys.se", "hemkop.se"],
+    "NO": ["oda.com", "meny.no", "spar.no"],
+    "PL": ["carrefour.pl", "auchan.pl", "biedronka.pl"],
+    "PT": ["continente.pt", "auchan.pt", "pingo-doce.pt"],
+}
 
-# --- PHASE 2.5: Smart EAN Discovery (Name + Weight) ---
-async def lookup_ean_name(ean: str, market_code: str) -> str:
-    # 1. Open Food Facts (Best for European Groceries)
-    off_url = f"https://world.openfoodfacts.org/api/v0/product/{ean}.json"
-    async with httpx.AsyncClient() as client:
-        try:
-            res = await client.get(off_url, timeout=5.0)
-            data = res.json()
-            if data.get("status") == 1:
-                p = data.get("product", {})
-                return f"{p.get('brands', '')} {p.get('product_name', '')} {p.get('quantity', '')}".strip()
-        except Exception:
-            pass
+CURRENCIES = {
+    "FR": "EUR", "NL": "EUR", "BE": "EUR", "DE": "EUR", "IT": "EUR",
+    "ES": "EUR", "PT": "EUR",
+    "UK": "GBP", "DK": "DKK", "SE": "SEK", "NO": "NOK", "PL": "PLN",
+}
 
-    # 2. SerpApi Organic Snippet Reading (AI Fallback)
-    if SERPAPI_API_KEY and model:
-        results = await run_serpapi_organic(f'"{ean}"', market_code)
-        snippets = [item.get("snippet", "") for item in results[:3]]
-        if snippets:
-            prompt = f"Based on these search snippets for barcode {ean}, what is the brand, product name, and weight/size? Return ONLY the text (e.g. 'Lassie Haverrijst 250g'). If unknown, return 'UNKNOWN'. Snippets: {snippets}"
-            try:
-                ai_res = model.generate_content(prompt)
-                name = ai_res.text.strip()
-                if name and "UNKNOWN" not in name: return name
-            except Exception: pass
-    return ""
 
-# --- THE BRAIN: Gemini Extraction (FIXED 400 ERROR) ---
-def extract_price_data(raw_text: str, ean: str, product_name: str, url: str, is_name_match: bool) -> dict:
-    if not model: return {"error": "Gemini API key not configured."}
-    match_flag = "[Name Match Only]" if is_name_match else "Regular"
-    
-    prompt = f"""
-    TARGET EAN: {ean}
-    DISCOVERED PRODUCT: {product_name if product_name else "Unknown"}
-    SOURCE URL: {url}
-    
-    Extract the pricing data from the raw text below.
-    Rules:
-    1. Verify EAN match OR strict Double Match (Brand + Weight + Variant).
-    2. Extract Regular Selling Value (RSV). If only promo exists, RSV is empty and flag is 'Promo-only'.
-    3. Ignore wholesale or 'from' prices.
-    4. Provide VAT info as 'incl. VAT (rate shown: X%)' OR 'incl. VAT (rate not stated)'.
-    5. Price type flag defaults to '{match_flag}' unless Promo-only or Clearance.
-    
-    Return ONLY valid JSON. Do not use markdown code blocks. Use exact keys: 
-    "vendor_name", "currency", "rsv_incl_vat", "vat_info", "promo_price", "price_type_flag", "pack_format", "source_url".
-    If rules aren't met, return {{"error": "No data found"}}.
-    
-    RAW TEXT:
-    {raw_text[:10000]}
-    """
+def build_scrape_prompt(ean: str, market: str) -> str:
+    """Build the prompt encoding the full phased search logic from the gem spec."""
+    market_upper = market.upper()
+    golden = GOLDEN_SITES.get(market_upper, [])
+    golden_str = ", ".join(golden)
+    currency = CURRENCIES.get(market_upper, "unknown")
+    site_queries = " OR ".join([f"site:{s}" for s in golden])
+
+    return f"""You are a precision price-scraping agent. Find the current regular retail price for the product identified by EAN barcode {ean} in market {market_upper} (currency: {currency}).
+
+CRITICAL RULES:
+- Accuracy over completeness. "No data found" is CORRECT only when ALL phases have been exhausted.
+- FORBIDDEN: guessing prices, inventing VAT rates, partial EAN matches.
+- Only consumer-facing retail prices. No wholesale, "from", or schema-only prices.
+- Amazon and eBay third-party sellers are excluded. However, if a niche specialist retailer on eBay is clearly a dedicated retailer (not a random third-party), it may be included and flagged as [Niche].
+
+EXHAUSTIVE SEARCH — YOU MUST EXECUTE ALL PHASES. DO NOT STOP EARLY.
+Even if Phase 1 finds results, CONTINUE to later phases to find additional sources.
+The goal is to find AS MANY valid retailer sources as possible. More rows = better.
+
+PHASE 1 — GOLDEN WEBSITES:
+Search: "{ean}" on these golden retailers: {golden_str}
+Try multiple queries:
+- "{ean}" {site_queries}
+- "{ean}" combined with individual retailer site: operators one by one
+- The EAN as a bare number with each retailer
+Record ALL valid results found. Then CONTINUE to Phase 2.
+
+PHASE 2 — EXTENDED RETAILERS:
+REGARDLESS of Phase 1 results, also search other well-known grocery retailers in {market_upper}.
+Search: "{ean}" on any national grocery chain, health food store, pet store, or specialist retailer operating in {market_upper}.
+EXCLUDE: Amazon marketplace, eBay random sellers, Bol.com third-party.
+Record ALL valid results found. Then CONTINUE to Phase 2.5.
+
+PHASE 2.5 — EAN LOOKUP (product identification):
+ALWAYS execute this phase. Search: "{ean}" on openfoodfacts.org, barcodelookup.com, ean-search.org.
+Extract: brand, product name, pack size/weight, any retailer links listed.
+DO NOT extract prices from these databases.
+Use the discovered product name to ALSO search retailers by name (flag results as [Name Match Only]).
+Then CONTINUE to Phase 3.
+
+PHASE 3 — NICHE / CLEARANCE / D2C RETAILERS:
+ALWAYS execute this phase. Search for the EAN and/or discovered product name on:
+- Specialist retailers, pet shops, health food shops, clearance grocers
+- Brand D2C websites
+- Any other retailer in the correct market with visible pricing
+Accept only if EAN is visible OR strict Double Match passes.
+Flag appropriately as [Niche], [Clearance], or [D2C].
+
+MATCHING RULES:
+Rule A — Explicit EAN: The exact EAN {ean} must be visible on the page or in the search snippet.
+Rule B — Double Match Heuristic: If EAN not visible, ALL THREE must match exactly:
+  1. Exact Brand
+  2. Exact Weight/Volume/Pack Size
+  3. Exact Product Title/Variant
+DISCARD any source that fails both Rule A and Rule B.
+Results found via product name search (not EAN) must be flagged [Name Match Only].
+
+PRICE RULES:
+- Report the regular/base consumer price including VAT.
+- FORBIDDEN: 2-for-X, 3-for-X, loyalty-only, basket discounts.
+- If ONLY a promo price exists: leave rsv_incl_vat empty, set price_type_flag to "Promo-only".
+- "Was" prices count as regular price.
+- Per-unit price ONLY if pack count is explicitly stated on the same page. Otherwise "Non-comparable".
+- Note if a product is out of stock but price is still visible — include it with a note in vendor_name like "VetUK (Out of stock)".
+
+OUTPUT — Return ONLY a valid JSON object with NO markdown formatting, NO code blocks, NO explanation before or after. The JSON must use this exact structure:
+{{
+  "ean": "{ean}",
+  "master_data": {{
+    "brand": "brand name or empty string if unknown",
+    "product_name": "full product name or empty string",
+    "pack_format": "e.g. 150g, 6 x 330ml, or empty string"
+  }},
+  "status": "found" or "no_data",
+  "ean_valid": true or false,
+  "phase_4_available": true or false,
+  "prices": [
+    {{
+      "vendor_name": "Retailer Name (or 'Retailer Name (Out of stock)' if applicable)",
+      "market": "{market_upper}",
+      "currency": "{currency}",
+      "rsv_incl_vat": "numeric price as string e.g. 2.00, or empty string if promo-only",
+      "vat_info": "incl. VAT (rate shown: X%)" or "incl. VAT (rate not stated)",
+      "promo_price": "promo price as string, or empty string",
+      "price_type_flag": "Regular" or "Promo-only" or "Non-comparable" or "[Name Match Only]" or "[Clearance]" or "[D2C]" or "[Niche]" or "[Niche] [Name Match Only]",
+      "pack_format": "e.g. 150g",
+      "per_unit_rsv": "per-unit price as string, or Non-comparable",
+      "source_url": "full URL where price is visible"
+    }}
+  ]
+}}
+
+Include EVERY valid source found across ALL phases. Aim for multiple rows per EAN.
+If truly no prices found after exhausting all phases, return status "no_data" with empty prices array.
+Search THOROUGHLY — execute at least 8-10 different search queries before concluding no data."""
+
+
+def parse_gemini_json(text: str) -> dict:
+    """Robustly extract JSON from Gemini response text."""
+    cleaned = text.strip()
+
+    # Strip markdown code blocks
+    if "```json" in cleaned:
+        cleaned = cleaned.split("```json", 1)[1]
+        if "```" in cleaned:
+            cleaned = cleaned.split("```", 1)[0]
+    elif "```" in cleaned:
+        cleaned = cleaned.split("```", 1)[1]
+        if "```" in cleaned:
+            cleaned = cleaned.split("```", 1)[0]
+
+    cleaned = cleaned.strip()
+
+    # Find outermost JSON object
+    start = cleaned.find("{")
+    if start < 0:
+        raise ValueError("No JSON object found in response")
+
+    # Find matching closing brace
+    depth = 0
+    for i in range(start, len(cleaned)):
+        if cleaned[i] == "{":
+            depth += 1
+        elif cleaned[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return json.loads(cleaned[start:i + 1])
+
+    # Fallback: try rfind
+    end = cleaned.rfind("}") + 1
+    if end > start:
+        return json.loads(cleaned[start:end])
+
+    raise ValueError("Could not extract valid JSON")
+
+
+async def call_gemini_for_ean(ean: str, market: str) -> dict:
+    """Call Gemini API with Google Search grounding to scrape price for one EAN."""
+    empty_result = {
+        "ean": ean, "status": "error",
+        "prices": [], "master_data": {"brand": "", "product_name": "", "pack_format": ""}
+    }
+
+    if not GEMINI_API_KEY:
+        empty_result["error"] = "GEMINI_API_KEY not configured"
+        return empty_result
+
+    prompt = build_scrape_prompt(ean, market)
+
     try:
-        # NO generation_config used here to avoid the 400 error!
-        response = model.generate_content(prompt)
-        raw_text = response.text.strip()
-        
-        # Smart regex parser to handle LLM markdown habits
-        if "```json" in raw_text: 
-            raw_text = raw_text.split("```json")[1].split("```")[0].strip()
-        elif "```" in raw_text: 
-            raw_text = raw_text.split("```")[1].split("```")[0].strip()
-            
-        return json.loads(raw_text)
-    except Exception as e:
-        return {"error": f"Failed to parse LLM response"}
+        client = genai.Client(api_key=GEMINI_API_KEY)
 
-# --- MAIN ORCHESTRATOR ---
+        grounding_tool = types.Tool(google_search=types.GoogleSearch())
+
+        config = types.GenerateContentConfig(
+            tools=[grounding_tool],
+            temperature=0.1,
+        )
+
+        # Run synchronous Gemini call in a thread to not block the event loop
+        def _call():
+            return client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config=config,
+            )
+
+        response = await asyncio.get_event_loop().run_in_executor(None, _call)
+
+        if not response or not response.text:
+            empty_result["error"] = "Empty response from Gemini"
+            return empty_result
+
+        result = parse_gemini_json(response.text)
+        result["ean"] = ean
+
+        # Enrich source URLs from grounding metadata where possible
+        grounding_urls = []
+        try:
+            if response.candidates and response.candidates[0].grounding_metadata:
+                gm = response.candidates[0].grounding_metadata
+                if gm.grounding_chunks:
+                    for chunk in gm.grounding_chunks:
+                        if hasattr(chunk, 'web') and chunk.web and hasattr(chunk.web, 'uri'):
+                            grounding_urls.append(chunk.web.uri)
+        except Exception:
+            pass
+
+        if grounding_urls and result.get("prices"):
+            for price_entry in result["prices"]:
+                if not price_entry.get("source_url"):
+                    vendor = price_entry.get("vendor_name", "").lower().split()[0] if price_entry.get("vendor_name") else ""
+                    for url in grounding_urls:
+                        if vendor and vendor in url.lower():
+                            price_entry["source_url"] = url
+                            break
+
+        return result
+
+    except json.JSONDecodeError as e:
+        empty_result["error"] = f"JSON parse error: {str(e)}"
+        return empty_result
+    except Exception as e:
+        empty_result["error"] = str(e)
+        return empty_result
+
+
+def compute_averages(all_results: list[dict]) -> dict:
+    """Compute average RSV per EAN following spec rules."""
+    averages = {}
+    for result in all_results:
+        ean = result.get("ean", "")
+        prices = result.get("prices", [])
+        if not prices:
+            averages[ean] = {"standard_avg": None, "total_avg": None, "count": 0}
+            continue
+
+        standard_prices = []
+        all_valid_prices = []
+
+        for p in prices:
+            flag = p.get("price_type_flag", "")
+            rsv = p.get("rsv_incl_vat", "")
+            if not rsv or flag in ("Promo-only", "Non-comparable"):
+                continue
+
+            try:
+                val = float(str(rsv).replace(",", ".").replace("£", "").replace("€", "").replace("kr", "").strip())
+            except (ValueError, AttributeError):
+                continue
+
+            all_valid_prices.append(val)
+            if flag not in ("[Clearance]", "[D2C]"):
+                standard_prices.append(val)
+
+        std_avg = round(sum(standard_prices) / len(standard_prices), 2) if standard_prices else None
+        total_avg = round(sum(all_valid_prices) / len(all_valid_prices), 2) if all_valid_prices else None
+
+        averages[ean] = {
+            "standard_avg": std_avg,
+            "total_avg": total_avg,
+            "count": len(all_valid_prices)
+        }
+
+    return averages
+
+
 @app.post("/scrape")
 async def run_scraper(request: ScrapeRequest):
-    if len(request.eans) > 10: raise HTTPException(status_code=400, detail="Max 10 EANs")
-    final_results = {}
-    
-    golden_sites = {
-        "FR": "(site:carrefour.fr OR site:auchan.fr OR site:coursesu.com OR site:intermarche.com OR site:monoprix.fr OR site:franprix.fr)",
-        "UK": "(site:tesco.com OR site:sainsburys.co.uk OR site:asda.com OR site:morrisons.com OR site:iceland.co.uk OR site:waitrose.com)",
-        "NL": "(site:ah.nl OR site:jumbo.com OR site:plus.nl OR site:dirk.nl OR site:vomar.nl)",
-        "BE": "(site:delhaize.be OR site:colruyt.be OR site:carrefour.be OR site:ah.be)",
-        "DE": "(site:rewe.de OR site:edeka.de OR site:kaufland.de OR site:dm.de OR site:rossmann.de)",
-        "DK": "(site:nemlig.com OR site:bilkatogo.dk OR site:rema1000.dk OR site:netto.dk)",
-        "IT": "(site:carrefour.it OR site:conad.it OR site:esselunga.it OR site:coop.it)",
-        "ES": "(site:carrefour.es OR site:mercadona.es OR site:dia.es OR site:alcampo.es)",
-        "SE": "(site:ica.se OR site:coop.se OR site:willys.se OR site:hemkop.se)",
-        "NO": "(site:oda.com OR site:meny.no OR site:spar.no)",
-        "PL": "(site:carrefour.pl OR site:auchan.pl OR site:biedronka.pl)",
-        "PT": "(site:continente.pt OR site:auchan.pt OR site:pingo-doce.pt)"
+    market = request.market.upper().strip()
+    eans = [e.strip() for e in request.eans if e.strip()]
+
+    if len(eans) > 10:
+        raise HTTPException(status_code=400, detail="Max 10 EANs per request")
+    if not eans:
+        raise HTTPException(status_code=400, detail="No EANs provided")
+    if market not in GOLDEN_SITES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported market. Supported: {', '.join(sorted(GOLDEN_SITES.keys()))}"
+        )
+
+    # Process EANs concurrently (max 3 at a time to respect rate limits)
+    semaphore = asyncio.Semaphore(3)
+
+    async def limited_call(ean):
+        async with semaphore:
+            return await call_gemini_for_ean(ean, market)
+
+    tasks = [limited_call(ean) for ean in eans]
+    results = await asyncio.gather(*tasks)
+
+    averages = compute_averages(results)
+
+    return {
+        "market": market,
+        "currency": CURRENCIES.get(market, "unknown"),
+        "results": results,
+        "averages": averages
     }
-    sites_query = golden_sites.get(request.market.upper(), "")
-
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        for ean in request.eans:
-            extracted_data = None
-            product_name = await lookup_ean_name(ean, request.market)
-            
-            # --- STRATEGY 1: SerpApi Google Shopping (Bypasses AH/Jumbo Bot Blocks!) ---
-            shopping_data = await run_serpapi_shopping(ean, request.market)
-            if not shopping_data and product_name:
-                shopping_data = await run_serpapi_shopping(product_name, request.market)
-            
-            if shopping_data:
-                final_results[ean] = shopping_data
-                continue
-
-            # --- STRATEGY 2: SerpApi Organic + Playwright Fallback ---
-            is_name_match = False
-            org_results = await run_serpapi_organic(f'"{ean}" {sites_query}', request.market)
-            
-            if not org_results and product_name:
-                is_name_match = True
-                org_results = await run_serpapi_organic(f'"{product_name}" {sites_query}', request.market)
-            
-            if not org_results:
-                final_results[ean] = {"status": "No data found", "error": f"No data found. (Name: {product_name or 'Unknown'})", "source_url": ""}
-                continue
-                
-            target_url = org_results[0].get("link", "")
-            
-            # Scrape with Playwright
-            page_text = ""
-            page = await browser.new_page()
-            try:
-                await page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "media", "font", "stylesheet"] else route.continue_())
-                await page.goto(target_url, wait_until="domcontentloaded", timeout=15000)
-                page_text = await page.evaluate("document.body.innerText")
-            except Exception:
-                pass
-            finally:
-                await page.close()
-            
-            if not page_text:
-                final_results[ean] = {"status": "Scraping failed", "source_url": target_url}
-                continue
-                
-            # Extract with Gemini
-            extracted_data = extract_price_data(page_text, ean, product_name, target_url, is_name_match)
-            if "source_url" not in extracted_data:
-                extracted_data["source_url"] = target_url
-            
-            final_results[ean] = extracted_data
-            
-        await browser.close()
-        
-    return {"market": request.market, "results": final_results}
